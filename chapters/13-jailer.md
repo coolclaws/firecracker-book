@@ -12,6 +12,10 @@ Jailer 的代码位于 `// src/jailer/src/main.rs`，它被编译为一个独立
 
 这种 "setup-then-drop-privileges" 模式在安全敏感的系统中非常常见（如 Chromium 的 sandbox broker），它确保了运行时进程只拥有最低限度的权限。
 
+### 设计取舍
+
+为什么 Jailer 是独立二进制文件而非 Firecracker 内部的一个模块？主要有三方面权衡。第一，如果沙盒逻辑嵌入 Firecracker，则 Firecracker 自身必须以 root 启动，这在进程生命周期中留下了一个高权限窗口——即使之后降级，任何在降级前的漏洞都可能被利用。独立二进制文件使得 root 权限仅存在于 Jailer 的执行期间，一旦 `exec()` 完成，root 上下文彻底消失。第二，分离后两个组件可以独立编译和审计，Jailer 的代码量很小（约两千行），安全审计成本极低。第三，这种设计也被考虑过的替代方案——如使用 Linux capabilities 细粒度授权——所否定，因为 capabilities 的组合爆炸和内核版本差异使其难以做到真正的最小权限，而 "全有然后全弃" 的模式更简单可靠。
+
 ## 13.2 Jailer 启动序列全貌
 
 Jailer 的启动是一个精心编排的多阶段流程，在 `// src/jailer/src/env.rs` 中实现。以下是完整的执行步骤：
@@ -39,6 +43,41 @@ Jailer 调用 `unshare()` 系统调用创建新的命名空间。
 **第六阶段：exec Firecracker**
 
 最后，Jailer 调用 `exec()` 将自身替换为 Firecracker 进程。此时 Firecracker 继承了所有沙盒限制，但不知道也不关心这些限制是如何建立的。
+
+### 核心流程
+
+```
+Jailer 启动序列（以 root 身份执行）
+
+  jailer (root)
+      |
+      +---> 解析命令行参数（binary path, id, uid, gid, cgroup...）
+      |
+      +---> 创建 jail 目录结构
+      |       /srv/jailer/firecracker/<id>/root/
+      |       +---> 复制 firecracker binary
+      |       +---> mknod /dev/kvm, /dev/urandom, /dev/net/tun
+      |
+      +---> 配置 cgroup
+      |       +---> 检测 cgroup v1 / v2
+      |       +---> 写入资源限制（cpuset, memory, cpu）
+      |       +---> 将进程加入 cgroup
+      |
+      +---> unshare() 创建新命名空间
+      |       +---> PID namespace
+      |       +---> Mount namespace
+      |       +---> Network namespace
+      |
+      +---> chroot() 切换根文件系统
+      |
+      +---> 权限降级
+      |       +---> setgroups(0, NULL)
+      |       +---> setgid(gid)
+      |       +---> setuid(uid)
+      |
+      +---> exec(firecracker)
+              （Jailer 进程被替换，root 权限彻底消失）
+```
 
 ## 13.3 chroot jail 的意义
 
@@ -89,6 +128,36 @@ Jailer 要求调用者指定运行 Firecracker 的 UID 和 GID。这些必须是
 虽然 seccomp 过滤器的加载发生在 Firecracker 进程内部（而非 Jailer 中），但 Jailer 通过环境设置为 seccomp 的有效运行创造了条件。chroot 环境中没有 `/proc/self/status` 以外的敏感接口，命名空间隔离确保了即使 seccomp 被绕过，攻击面仍然是最小的。
 
 Jailer 和 seccomp 的分工体现了纵深防御的理念：Jailer 负责进程级别的隔离（文件系统、网络、资源），seccomp 负责系统调用级别的过滤。两者互为补充，任何单一层的失败都不会导致完全的安全崩溃。
+
+### 模块关系
+
+```
+Jailer 沙盒各层协作关系
+
++---------------------+
+|   Jailer binary     |  (root 权限，仅在启动阶段存在)
++---------------------+
+         |
+         | exec()
+         v
++---------------------+     +---------------------+
+|   Firecracker VMM   |<--->|   seccomp filters   |
+|  (非特权用户运行)    |     |  (系统调用白名单)    |
++---------------------+     +---------------------+
+         |
+    受以下层约束：
+         |
+    +----+----+----+----+
+    |    |    |    |    |
+    v    v    v    v    v
+ chroot cgroup PID  Mount Network
+  jail  限制   NS   NS    NS
+    |    |    |    |    |
+    v    v    v    v    v
+  最小  CPU/  进程  挂载  网络
+  文件  内存  隔离  隔离  隔离
+  系统  配额
+```
 
 ## 本章小结
 

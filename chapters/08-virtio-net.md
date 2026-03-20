@@ -29,6 +29,10 @@ Firecracker 使用 Linux TAP 设备作为网络后端。TAP 是一个二层（L2
 
 TAP 设备被设置为非阻塞模式（`O_NONBLOCK`），这对 Firecracker 的事件驱动架构至关重要。当 TAP 设备上有数据可读时，epoll 会通知 VMM 的事件循环；VMM 随即从 TAP 读取数据包并注入 Guest 的 RX queue。如果使用阻塞模式，一次读操作可能阻塞整个事件循环，影响所有设备的响应性。
 
+### 设计取舍
+
+为什么选择 TAP 后端而非其他方案？主要的替代方案有两个：vhost-net 和 vhost-user。vhost-net 是 Linux 内核模块，它将 virtio 数据面处理下沉到内核态，通过直接在 Guest 内存和 socket buffer 之间拷贝数据来消除用户态中转，通常能提升 20-30% 的网络吞吐量。但 vhost-net 将设备模拟代码放在内核中，扩大了 TCB（Trusted Computing Base），与 Firecracker 的安全优先原则相矛盾。vhost-user 将设备模拟放在独立的用户态进程中，通过共享内存通信，隔离性更好，但引入了额外的进程管理复杂度和 IPC 延迟。TAP 后端是最简单的方案：所有数据面逻辑都在 VMM 进程内完成，代码路径清晰可审计，且 TAP 是 Linux 中最成熟、最稳定的虚拟网络接口。性能上的差距通过批量处理和 ioeventfd/irqfd 快速路径得到了部分弥补。
+
 ## 数据包发送：从 Guest 到 Host
 
 当 Guest 应用程序发送一个网络数据包时，数据经历以下路径：
@@ -42,6 +46,80 @@ TAP 设备被设置为非阻塞模式（`O_NONBLOCK`），这对 Firecracker 的
 
 ```
 // src/vmm/src/devices/virtio/net/device.rs
+```
+
+### 核心流程
+
+以下是数据包 TX（发送）和 RX（接收）的完整路径：
+
+```
+TX 路径 (Guest ---> Host)
+=========================
+
+Guest 应用
+    | sendmsg()
+    v
+Guest 内核协议栈
+    | 构建以太网帧
+    v
+Guest virtio-net 驱动
+    | 写入 Descriptor Table
+    | 更新 TX Available Ring
+    | 写入 MMIO notify
+    v
++---+--- ioeventfd ----+---> VMM 事件循环
+                        |
+                        v
+                  TX Handler
+                  +---> pop Available Ring
+                  +---> GuestMemory.read (GPA ---> HVA)
+                  +---> 写入 TAP fd
+                  +---> 更新 TX Used Ring
+                  +---> irqfd 注入中断
+                        |
+                        v
+                  Linux TAP 设备
+                        |
+                        v
+                  Host 网络栈 / 物理网卡
+
+
+RX 路径 (Host ---> Guest)
+=========================
+
+Host 网络栈 / 物理网卡
+    |
+    v
+Linux TAP 设备
+    | epoll 通知可读
+    v
+VMM 事件循环
+    |
+    v
+RX Handler
+    +---> 从 TAP fd 读取帧数据
+    +---> pop RX Available Ring (Guest 预分配的空缓冲区)
+    |         |
+    |    +----+----+
+    |    |         |
+    |  有缓冲区  无缓冲区
+    |    |         |
+    |    |         v
+    |    |    暂存 deferred frame
+    |    |    等待 Guest 补充缓冲区
+    |    v
+    +---> GuestMemory.write (数据 ---> Guest 缓冲区)
+    +---> 更新 RX Used Ring
+    +---> irqfd 注入中断
+              |
+              v
+        Guest virtio-net 驱动
+              | 从 Used Ring 取出数据
+              v
+        Guest 内核协议栈
+              |
+              v
+        Guest 应用 recvmsg()
 ```
 
 TX 处理中一个重要的优化是批量处理（batch processing）。VMM 不会每收到一个 notify 就只处理一个描述符，而是在一次事件回调中尽可能多地处理 available ring 中的所有待发送包。这减少了事件处理的固定开销。
@@ -86,6 +164,10 @@ Firecracker 在网络性能上做了多项针对性优化：
 **缓冲区管理。** Firecracker 使用固定大小的临时缓冲区来中转数据包，避免了动态内存分配的开销。缓冲区大小设定为 65562 字节，足以容纳最大的以太网帧（含 virtio-net header）。
 
 **事件合并。** 在高吞吐场景下，一次事件回调中批量处理多个数据包，摊薄了每个包的事件处理固定开销。
+
+### 设计取舍
+
+批量处理（batch processing）是在延迟和吞吐量之间的一个经典权衡。逐包处理模式下，每个数据包到达后立即处理并通知 Guest，延迟最低但每包开销最大（每次都要触发 irqfd 中断注入）。完全批量模式下，积攒大量数据包后一次性处理并发送一次中断，吞吐量最高但可能引入毫秒级延迟。Firecracker 采用了折中方案：在一次事件回调中处理所有当前可用的数据包（"drain available ring"），然后发送一次中断。这意味着批量大小是自适应的——低负载时通常只有一个包，行为接近逐包处理；高负载时 available ring 中积累了多个包，自然形成批量。这种设计无需额外的定时器或水位线参数，实现简单且效果良好。
 
 ## 本章小结
 

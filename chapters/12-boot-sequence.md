@@ -19,6 +19,78 @@
 
 这个顺序不是随意的。每一步都依赖于前一步的结果。例如，内核加载需要先有 guest 内存；设备初始化需要先有中断控制器；vCPU 配置需要知道内核的入口地址。`build_microvm()` 的设计体现了一个原则：将复杂的启动过程分解为可测试的独立步骤，同时保证步骤间的依赖关系明确可见。
 
+### 核心流程
+
+```
+HTTP API: InstanceStart 请求
+        |
+        v
++---------------------------+
+| build_microvm()           |  总调度入口
++---------------------------+
+        |
+        v
++---------------------------+
+| 1. KVM_CREATE_VM          |  创建 VM 文件描述符
++---------------------------+
+        |
+        v
++---------------------------+
+| 2. 配置 Guest 内存         |  mmap 分配内存区域
+|    KVM_SET_USER_MEMORY     |  注册到 KVM
++---------------------------+
+        |
+        v
++---------------------------+
+| 3. 加载内核镜像            |
+|    x86: bzImage protocol  |  +---> 解析 setup header
+|    ARM: PE Image          |  +---> 写入 Guest 内存
++---------------------------+
+        |
+        v
++---------------------------+
+| 4. 配置启动参数            |
+|    x86: boot_params +     |  +---> E820 内存表
+|         cmdline           |  +---> 内核命令行
+|    ARM: FDT               |  +---> Device Tree blob
++---------------------------+
+        |
+        v
++---------------------------+
+| 5. (可选) 加载 initrd     |  写入内核上方的内存区域
++---------------------------+
+        |
+        v
++---------------------------+
+| 6. 初始化中断控制器        |
+|    x86: KVM_CREATE_IRQCHIP|  PIC + IOAPIC + LAPIC
+|    ARM: KVM_CREATE_DEVICE |  GICv3 (或 fallback GICv2)
++---------------------------+
+        |
+        v
++---------------------------+
+| 7. 创建并配置设备          |
+|    +---> virtio-net       |  分配 MMIO 地址 + IRQ
+|    +---> virtio-block     |  注册 ioeventfd/irqfd
+|    +---> virtio-vsock     |
+|    +---> serial (legacy)  |
++---------------------------+
+        |
+        v
++---------------------------+
+| 8. 配置 vCPU              |
+|    x86: 64-bit long mode  |  设置 CR0/CR3/CR4, 页表,
+|         RIP=内核入口       |  RSI=boot_params 地址
+|    ARM: PC=内核入口        |  x0=FDT 地址, EL1 模式
++---------------------------+
+        |
+        v
++---------------------------+
+| 9. 启动 vCPU 线程         |  每个 vCPU 一个线程
+|    KVM_RUN 主循环          |  Guest 内核开始执行
++---------------------------+
+```
+
 ## 12.2 内核加载：x86 的 bzImage 协议
 
 在 x86_64 架构上，Firecracker 支持加载标准的 Linux bzImage 格式内核。内核加载的实现位于 `// src/vmm/src/builder.rs` 以及底层的 linux-loader crate 中。
@@ -53,6 +125,10 @@ Firecracker 需要填充的关键字段包括：
 这个内存映射表告诉内核哪些物理地址范围可以使用，哪些被硬件保留。虽然 microVM 没有真实的 VGA 或 BIOS ROM，但 Linux 内核期望看到标准的内存布局，因此 Firecracker 必须模拟这种布局以保证兼容性。
 
 **内核命令行** 通过 boot parameters 中的指针传递给内核。命令行字符串被写入 guest 内存的特定位置（在 `// src/vmm/src/arch/x86_64/layout.rs` 中定义），boot parameters 中记录其地址和长度。用户通过 API 设置的 `boot_args` 字符串最终就是通过这个机制到达 guest 内核的。典型的命令行包含 `console=ttyS0 reboot=k panic=1` 等参数，其中 `console=ttyS0` 将串口配置为控制台输出，`reboot=k` 使用键盘控制器复位，`panic=1` 让内核在 panic 后 1 秒重启。
+
+### 设计取舍
+
+Firecracker 选择直接通过 Linux Boot Protocol 传递启动参数，而非模拟 BIOS/UEFI 固件来完成这一工作。传统虚拟机（如 QEMU）可以搭配 SeaBIOS 或 OVMF 固件，由固件负责硬件探测、内存映射构建和内核加载。这种方式兼容性极强（甚至可以启动 Windows），但固件执行本身需要数百毫秒甚至数秒。Firecracker 直接在 VMM 中构建 boot_params 结构体、填充 E820 表、设置内核命令行，并将 vCPU 直接配置为 64-bit 长模式——完全跳过了 real mode 到 protected mode 的切换过程。代价是只能启动符合 Linux Boot Protocol 的内核，无法运行其他操作系统。但对于 Serverless 场景，这个限制完全可以接受，换来的是将固件阶段的耗时压缩为零。ARM 侧使用 FDT 的方案同样遵循这一思路：用数据结构直接描述硬件拓扑，无需固件层的动态探测。
 
 ## 12.4 initrd 加载
 

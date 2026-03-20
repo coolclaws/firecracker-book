@@ -16,6 +16,43 @@ Firecracker 的快照系统将 microVM 的完整状态分为两个部分：
 
 快照相关的 API 端点定义在 `// src/vmm/src/rpc_interface.rs` 中，核心实现位于 `// src/vmm/src/persist.rs` 以及各设备的状态序列化代码中。
 
+### 模块关系
+
+```
+Snapshot 系统模块协作
+
++------------------+
+|   HTTP API 层    |  PUT /snapshot/create, PUT /snapshot/load
++------------------+
+         |
+         v
++------------------+
+| rpc_interface.rs |  VmmAction::CreateSnapshot / LoadSnapshot
++------------------+
+         |
+         v
++------------------+     +-------------------+
+|   persist.rs     |---->|   versionize      |
+| (快照协调中心)    |     | (版本化序列化框架) |
++------------------+     +-------------------+
+    |          |
+    v          v
++--------+ +-------------------+
+| memory | | device_manager/   |
+| dump/  | | persist.rs        |
+| restore| | (各设备状态导出)   |
++--------+ +-------------------+
+    |          |
+    v          v
++--------+ +-------------------+
+| guest  | | 各设备 State 结构  |
+| memory | | - VcpuState       |
+| file   | | - VirtioNetState  |
++--------+ | - VirtioBlockState|
+           | - SerialState     |
+           +-------------------+
+```
+
 ## 14.2 versionize：版本化序列化框架
 
 状态序列化是快照系统中最具挑战性的部分。Firecracker 使用自研的 `versionize` crate（位于 `// src/versionize` 或作为外部依赖引入）来解决这个问题。为什么不用 serde + bincode 等成熟方案？
@@ -30,6 +67,10 @@ versionize 通过以下机制实现版本兼容：
 - 新增的字段可以指定默认值，使得旧版本的快照可以在新版本中恢复
 
 这种设计使得 Firecracker 可以在升级版本后仍然加载旧版本创建的快照，这对于生产环境中的滚动升级至关重要。`// src/vmm/src/device_manager/persist.rs` 中可以看到各设备状态结构体如何使用 versionize 宏来声明版本信息。
+
+### 设计取舍
+
+为什么自研 versionize 而不使用 serde + bincode 或 Protocol Buffers？核心原因在于 schema 演化的可控性。serde + bincode 在字段增删时会破坏二进制兼容性，除非引入额外的版本管理层。Protocol Buffers 虽然原生支持 schema 演化，但它引入了一个庞大的外部依赖和代码生成步骤，与 Firecracker 最小化依赖的哲学相悖。此外，protobuf 的序列化格式包含字段标签等元数据开销，而 versionize 的紧凑二进制格式在快照这种性能敏感的场景中更高效。versionize 的缺点是维护成本——每次结构变更都需要手动标注版本信息——但对于 Firecracker 这种字段变更频率不高的项目，这个成本是可接受的。
 
 ## 14.3 创建快照的完整流程
 
@@ -47,6 +88,58 @@ versionize 通过以下机制实现版本兼容：
 
 **第六步：保存 guest 内存**。将 guest 的物理内存内容写入另一个文件。对于全量快照，直接 dump 整个内存区域；对于增量快照，只写入脏页。
 
+### 核心流程
+
+```
+快照创建流程（PUT /snapshot/create）
+
+  API 请求到达
+      |
+      +---> 暂停所有 vCPU 线程
+      |
+      +---> 保存 vCPU 状态
+      |       +---> KVM_GET_REGS（通用寄存器）
+      |       +---> KVM_GET_SREGS（段寄存器）
+      |       +---> KVM_GET_MSRS（MSR 寄存器）
+      |
+      +---> 保存设备状态
+      |       +---> 串口 SerialState
+      |       +---> virtio-net VirtioNetState
+      |       +---> virtio-block VirtioBlockState
+      |       +---> virtqueue 配置（desc table, avail/used ring）
+      |
+      +---> 保存中断控制器状态
+      |       +---> IOAPIC (x86) / GIC (ARM)
+      |
+      +---> versionize 序列化 ---> vmstate 文件
+      |
+      +---> 保存 guest 内存
+              +---> [全量] dump 整个内存区域 ---> memory 文件
+              +---> [增量] KVM_GET_DIRTY_LOG ---> 脏页位图 + 脏页数据
+
+
+快照恢复流程（PUT /snapshot/load）
+
+  API 请求到达
+      |
+      +---> 创建新的 KVM VM 实例
+      |
+      +---> 恢复 guest 内存
+      |       +---> 加载全量 memory 文件
+      |       +---> [如有增量] 覆盖脏页
+      |
+      +---> versionize 反序列化 vmstate 文件
+      |
+      +---> 重建设备（从 State 恢复，非零初始化）
+      |
+      +---> 恢复中断控制器（IOAPIC / GIC）
+      |
+      +---> 恢复 vCPU 寄存器状态
+      |       +---> KVM_SET_REGS / KVM_SET_SREGS / KVM_SET_MSRS
+      |
+      +---> 启动 vCPU 线程，guest 从暂停点继续执行
+```
+
 ## 14.4 全量快照与增量快照
 
 Firecracker 支持两种内存快照模式，这是在创建快照时通过 API 参数指定的：
@@ -58,6 +151,10 @@ Firecracker 支持两种内存快照模式，这是在创建快照时通过 API 
 增量快照的优势在于大幅减小文件体积。对于一个内存基本稳定的 microVM，增量快照可能只有几 MB，远小于全量快照。但增量快照依赖于一个"基础"全量快照，恢复时需要先加载基础快照再应用增量。
 
 为什么 Firecracker 不支持多级增量链？因为增量链越长，恢复时需要合并的层越多，恢复时间和复杂度都会增加。Firecracker 的设计选择是保持简单：一个全量基础加最多一个增量。这足以满足主要使用场景（快速更新快照），同时避免了复杂的合并逻辑。
+
+### 设计取舍
+
+增量快照的设计面临两个关键取舍。第一是脏页追踪的粒度：KVM 的 `KVM_GET_DIRTY_LOG` 以 4KB 页为单位追踪，即使只修改了一个字节也会标记整个页为脏。更细粒度的追踪（如字节级）会带来巨大的元数据开销和性能损耗，4KB 页粒度是硬件支持的自然边界，也是存储效率与追踪成本之间的最佳平衡点。第二是增量链的深度限制：Firecracker 只允许"一个全量 + 一个增量"的两层结构，而非像容器镜像那样支持多层叠加。多级增量链在恢复时需要按序合并每一层，既增加恢复延迟也增加实现复杂度，还引入了链中任一层损坏导致整个快照不可用的风险。对于 Firecracker 追求的毫秒级恢复场景，这种复杂性得不偿失。
 
 ## 14.5 恢复流程
 
